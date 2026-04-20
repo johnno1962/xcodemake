@@ -16,6 +16,7 @@
 
 use IO::File;
 use Digest::MD5 qw(md5_hex);
+use JSON::PP;
 use strict;
 
 my $dir = ".xcodemake";
@@ -51,6 +52,85 @@ my ($LOG, $fileArg);
 # regex for file path argument
 my $notSpace = "[^\\\\\\s]";
 $fileArg = "$notSpace+(?:\\\\.$notSpace*)*";
+
+sub escape {
+    my ($chars) = @_;
+    return unless defined $_[1];
+    my $quoted = quotemeta $chars;
+    $_[1] =~ s/([$quoted])/\\$1/g;
+}
+
+sub unescape {
+    my ($chars) = @_;
+    return unless defined $_[1];
+    my $quoted = quotemeta $chars;
+    $_[1] =~ s/\\([$quoted])/$1/g;
+}
+
+# escape $ for make
+sub dollarEscape {
+    return unless defined $_[0];
+    $_[0] =~ s/\$/\$\$/g;
+}
+
+# escape file path for shell/make recipe use
+sub shellEscape {
+    escape "()", $_[0];
+    dollarEscape $_[0];
+}
+
+# Extract values for the option from a command
+sub extractOption {
+    my ($line, $option) = @_;
+    return unless defined $line;
+    return my @a = $line =~ / $option ($fileArg)/g;
+}
+
+sub unescapePath {
+    my ($path) = @_;
+    return unless defined $path;
+    $path =~ s/\\(.)/$1/g;
+    return $path;
+}
+
+sub makeTargetPath {
+    my ($path) = @_;
+    $path = unescapePath($path);
+    escape "\$& ", $path;
+    return $path;
+}
+
+sub makeDependencyPath {
+    my ($path) = @_;
+    $path = unescapePath($path);
+    escape " ", $path;
+    dollarEscape $path;
+    return $path;
+}
+
+sub shellPath {
+    my ($path) = @_;
+    $path = unescapePath($path);
+    shellEscape $path;
+    escape " ", $path;
+    return $path;
+}
+
+sub nextLine {
+    my $line = $LOG->getline() or return;
+    chomp $line;
+    return $line;
+}
+
+sub nextCD {
+    my $line = nextLine() or return;
+    my ($cd) = $line =~ /cd (.*)/;
+    return unless defined $cd;
+    unescape "^\$'()&", $cd;
+    escape " ", $cd;
+    dollarEscape $cd;
+    return "\t\tcd $cd\n\t\t/usr/bin/time ";
+}
 
 # Recapture xcodebuild output if paramaters change or project has been edited
 if (! -f $log || `find . -name project.pbxproj -newer '$log'`) {
@@ -120,43 +200,6 @@ sub makefileMatchesVariant {
 sub generateMakefile {
     $LOG = IO::File->new("< $log") or die "Could not open $log: $!";
 
-    sub escape {
-        $_[1] =~ s/([$_[0]])/\\$1/g;
-    }
-    sub unescape {
-        $_[1] =~ s/\\([$_[0]])/$1/g;
-    }
-
-    # escape $ for make
-    sub dollarEscape {
-        $_[0] =~ s/\\\$/\\\$\$/g;
-    }
-    # escape file path
-    sub shellEscape {
-        escape "()", $_[0];
-        dollarEscape $_[0];
-    }
-
-    sub nextLine {
-        my $line = $LOG->getline() or return;
-        chomp $line;
-        return $line;
-    }
-
-    sub nextCD {
-        my ($cd) = nextLine() =~ /cd (.*)/;
-        unescape "^\$'()&", $cd;
-        escape " ", $cd;
-        dollarEscape $cd;
-        return "\t\tcd $cd\n\t\t/usr/bin/time ";
-    }
-
-    # Extract values for the option from a command
-    sub extractOption {
-        my ($line, $option) = @_;
-        return my @a = $line =~ / $option ($fileArg)/g;
-    }
-
     my $MAKE = IO::File->new("> $make") or die "Could not open $make: $!";
     print $MAKE <<HEADER;
 #
@@ -169,6 +212,18 @@ default: main
 HEADER
 
     my (%rules, @linked, @codesigns);
+    my $json = JSON::PP->new->utf8;
+    my $printSwiftRule = sub {
+        my ($object, $source, $command, $cd) = @_;
+        return unless defined $object && defined $source && defined $command && defined $cd;
+
+        my $target = makeTargetPath($object);
+        return if $rules{$target}++;
+
+        print $MAKE "\n$target: @{[makeDependencyPath($source)]}\n";
+        print $MAKE "$cd$command && touch @{[shellPath($object)]}\n\n";
+    };
+
     while (defined(my $line = nextLine())) {
         print $MAKE "# $line\n";
         # Add rules for "C" family sources.
@@ -186,31 +241,64 @@ HEADER
             shellEscape $object;
             dollarEscape $line;
             print $MAKE "$cd$line && touch $object\n\n";
+        # Add rules for SwiftDriver output (Xcode 16.3+).
+        } elsif ($line =~ /^SwiftDriver .* com\.apple\.xcode\.tools\.swift\.compiler/) {
+            my $cd = nextCD();
+            my $driver = nextLine();
+            next unless defined $driver;
+            next unless $driver =~ s/^\s*builtin-SwiftDriver\s+--\s+//;
+            $driver =~ s/\s+-use-frontend-parseable-output//;
+
+            my ($outputMap) = $driver =~ / -output-file-map ($fileArg)/;
+            unless (defined $outputMap) {
+                warn "Could not find SwiftDriver -output-file-map: $driver\n";
+                next;
+            }
+            $outputMap = unescapePath($outputMap);
+
+            my $MAP = IO::File->new("< $outputMap");
+            unless ($MAP) {
+                warn "Could not open SwiftDriver output file map $outputMap: $!\n";
+                next;
+            }
+            my $mapContent = do { local $/; <$MAP> };
+            close $MAP;
+
+            my $outputFiles = eval { $json->decode($mapContent) };
+            if ($@ || ref $outputFiles ne "HASH") {
+                warn "Could not parse SwiftDriver output file map $outputMap: $@\n";
+                next;
+            }
+
+            dollarEscape $driver;
+            # macOS ships GNU Make 3.81, which does not support grouped targets.
+            for my $source (sort keys %$outputFiles) {
+                next unless $source =~ /\.swift$/;
+                next unless ref $outputFiles->{$source} eq "HASH";
+                $printSwiftRule->($outputFiles->{$source}->{object}, $source, $driver, $cd);
+            }
         # Add rules for Swift sources (expand batches)
         } elsif ($line =~ /^SwiftCompile \w+ \w+/) {
             my $cd = nextCD();
-            ($line = nextLine()) =~
-                s/builtin-swiftTaskExecution -- |-frontend-parseable-output//g;
+            next unless defined $cd;
+            $line = nextLine();
+            next unless defined $line;
+            next unless $line =~ /builtin-swiftTaskExecution|swift-frontend/;
+            $line =~ s/builtin-swiftTaskExecution -- |-frontend-parseable-output//g;
             my @sources = extractOption($line, "-primary-file")
-                or warn "Release/Whole module optimization not permitted: $line";
+                or next;
             my @objects = extractOption($line, "-o");
             # print "# $line\n@sources -- @objects\n\n";
             dollarEscape $line;
             foreach my $i (0..$#sources) {
-                unescape "{}()", my $object = $objects[$i];
-                unescape "\$'&{}()*", $sources[$i];
-                $sources[$i] =~ s/\$/\$\$/g;
-                next if $rules{$object}++;
-                print $MAKE "\n$object: $sources[$i]\n";
-                shellEscape $object;
-                print $MAKE "$cd$line && touch $object\n\n";
+                $printSwiftRule->($objects[$i], $sources[$i], $line, $cd);
             }
         # Add rule to link executables
         } elsif (my ($executable) = $line =~ /^Ld ($fileArg) /) {
             my $cd = nextCD();
             $line = nextLine();
             my ($linkfile) = extractOption($line, "-filelist") or next;
-            $linkfile =~ s/\\(.)/$1/g;
+            $linkfile = unescapePath($linkfile);
             print("Link file for $executable: $linkfile\n");
             my $OBJS = IO::File->new("< $linkfile") || IO::File->new("< /dev/null");
             escape "&\$", $executable;
